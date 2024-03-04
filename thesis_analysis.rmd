@@ -15,6 +15,32 @@ source(here::here("InitializeProject.R"))
 library(tidyverse); packageVersion("tidyverse")
 library(magrittr); packageVersion("magrittr")
 ```
+### Generate manifest file for FragPipe
+```{r generate fragpipe manifest}
+# Get list of mzML files with full path names
+ms_data_dir <- normalizePath("data/ms_data/mzml")
+ms_files <- list.files(ms_data_dir, pattern = "mzML", full.names = TRUE)
+
+# create data frame for fragpipe manifest
+# extract experiments (condition_time) from file names 
+fp_manifest <- data.frame(file = ms_files, stringsAsFactors = FALSE) %>%
+  mutate(experiment = str_extract(file, "N_[A-Z]_t[0-5]"),
+         # extract bioreplicates from file names
+         bioreplicate = gsub(".mzML", "", str_extract(file, "[1-3].mzML$")),
+         # add column with data type "DDA"
+         data_type = "DDA") %>%
+  # select rows where experiment is not NA
+  filter(!is.na(experiment)) %>%
+  set_colnames(c("file", "experiment", "bioreplicate", "data_type"))
+
+# export tab separated file with the name "fragpipe-files.fp-manifest"
+write.table(fp_manifest, file = here::here("data/fragpipe-files.fp-manifest"),
+            sep = "\t", quote = FALSE, row.names = FALSE, col.names = FALSE)
+```
+
+
+### Download contaminants database
+
 Download Cambridge Centre for Proteomics cRAP FASTA database (CCP cRAP)
 ```{r download cRAP database}
 #remotes::install_github("CambridgeCentreForProteomics/camprotR", dependencies = TRUE)
@@ -23,14 +49,16 @@ Download Cambridge Centre for Proteomics cRAP FASTA database (CCP cRAP)
 ```
 > Downloading from UniProtKB release: 2023_05
 
-Proteins were identified using the FragPipe suite with LFQ. The output file "combined_protein.tsv" is used for the subsequent analysis.
+This databse will be concatinated with a protein database downloaded from Uniprot. Decoys will be added to the combined database using Philosopher and the resulting database will be used for the subsequent analysis. Proteins were identified using the FragPipe suite with LFQ. The output file "combined_protein.tsv" is used for the subsequent differential expression analysis.
 ```{r}
 datadir <- "results/00_fragpipe/240210"
 
 ```
 
 
-## Anlysis in LIMMA
+### Anlysis in LIMMA
+
+#### Load data into an ExpressionSet object
 ```{r load_data}
 library(Biobase); packageVersion("Biobase")
 
@@ -80,7 +108,8 @@ sample_annotation <- sample_annotation %>%
   # extract information from sample names using regular expressions
   mutate(CONDITION = gsub("[NS]_", "", str_extract(SAMPLEID, "[NS]_[A-Z]")),
          REPLICATE = gsub("_", "", str_extract(SAMPLEID, "_[1-3]$")),
-         TIME = str_extract(SAMPLEID, "t[0-5]")) %>%
+         TIME = str_extract(SAMPLEID, "t[0-5]"),
+         FACTOR = str_extract(SAMPLEID, "[A-Z]_t[0-5]")) %>%
   mutate(rowname = SAMPLEID) %>%
   column_to_rownames()
 
@@ -98,6 +127,9 @@ validObject(eset)
 eset %>%
   rio::export(here::here(datadir, "eset.RDS"))
 ```
+#### Linear model with limma only considering the condition
+
+This analysis does not consider time, which is likely to have an effect on protein expression. This is a preliminary analysis to identify proteins that are differentially expressed between conditions. A more comprehensive analysis will be performed later, considering both condition and time.
 
 
 ```{r linear model with limma}
@@ -115,7 +147,6 @@ design <- model.matrix(~0 + CONDITION, data = eset)
 colnames(design) <- levels(eset$CONDITION)
 
 # Define conditions for contrast matrix
-#contrasts <- list(B_VS_A_0 = "N_B_t0-N_A_t0")
 contrasts <- list()
 # loop through conditions except the control "A" to define contrasts
 for (condition in levels(eset$CONDITION)[-1]) {
@@ -187,6 +218,148 @@ top_proteins %>%
           cexCol = 1, cexRow = 0.5, # axis label size
           main = "Most significantly deregulated proteins")
 ```
+#### Linear model with condition and time
+```{r linear model with limma: condition and time}
+
+# Convert 'CONDITION' to factor
+eset$CONDITION <- as.factor(eset$CONDITION)
+eset$TIME <- as.factor(eset$TIME)
+eset$FACTOR <- as.factor(eset$FACTOR)
+
+# factor condition_time 
+# design (~0 + factor)
+# contrasts
+# condA_t2 - condA_t1, ...
+# condB_t2 - condB_t1, ...
+# condA_t1 - condB_t1
+
+# Construct design matrix
+design2 <- model.matrix(~0 + FACTOR, data = eset)
+# set names for the design matrix columns
+colnames(design2) <- levels(eset$FACTOR)
+
+
+# Initiate contrast list
+contrasts <- list()
+
+# For each condition make contrast of time points: A_t0-A_t1, A_t3-A_t1, ...
+# Loop through conditions
+for (condition in levels(eset$CONDITION)){
+  # initiate prev_factor as first factor in the condition
+  prev_factor <- grep(condition, levels(eset$FACTOR), value = TRUE)[1]
+  # loop through remaining factors of the condition and build contrasts
+  for (factor in grep(condition, levels(eset$FACTOR), value = TRUE)[-1]){
+    # Create contrast name and contrast
+    contrast_name <- paste(prev_factor, "vs", factor, sep = "_")
+    contrast <- paste(prev_factor, factor, sep = " - ")
+    # Store contrast in the list
+    contrasts[[contrast_name]] <- contrast
+    # Update prev_factor
+    prev_factor <- factor
+  }
+}
+
+# For each time point make contrasts of factors: A_t1-B_t1, A_t1-C_t1, ...
+# Loop through time points
+for (t in levels(eset$TIME)){
+  # Iterate through each combination of factors
+  for(factor in grep(t, levels(eset$FACTOR), value = TRUE)){
+    for (factor2 in grep(t, levels(eset$FACTOR), value = TRUE)){
+      # Check if factors are not identical
+      if (!identical(factor, factor2)){
+        # Create contrast name and contrast
+        contrast_name <- paste(substr(factor,1, 1), "vs", factor2, sep = "_")
+        contrast <- paste(factor, factor2, sep = " - ")
+        # Store contrast in the list
+        contrasts[[contrast_name]] <- contrast
+      }
+    }
+  }
+}
+
+# For each time point create contrasts from unique combinations of factors
+# # Loop through time points
+# for (t in levels(eset$TIME)) {
+#   # Subset factors for the current time point
+#   factors <- grep(t, levels(eset$FACTOR), value = TRUE)
+#   
+#   # Generate all unique combinations of factors
+#   factor_combinations <- combn(factors, 2, simplify = FALSE)
+#   
+#   # Iterate over each combination
+#   for (combination in factor_combinations) {
+#     factor1 <- combination[1]
+#     factor2 <- combination[2]
+#     
+#     # Create contrast name and contrast
+#     contrast_name <- paste(substr(factor1, 1, 1), "VS", factor2, sep = "_")
+#     contrast <- paste(factor1, factor2, sep = " - ")
+#     
+#     # Store contrast in the list if not already present
+#     contrasts[[contrast_name]] <- contrast
+#   }
+# }
+
+
+# Construct constrast matrix
+contrast_matrix2 <- makeContrasts(contrasts = contrasts, levels = design2)
+colnames(contrast_matrix2) <- names(contrasts)
+
+# Define linear model
+fit2 <- eset %>%
+  # linear regression of every protein against designmatrix as covariable
+  lmFit(design2) %>%
+  # include constrast matrix
+  contrasts.fit(contrast_matrix2) %>%
+  # Empirical Bayes Statistics for Differential Expression
+  eBayes
+
+```
+```{r heatmap of top proteins}
+top_proteins <- topTable(fit2, number = Inf)
+
+topTable(fit2, number = Inf) %>%
+  # select Protein.ID, Description and contrasts
+  select(Protein.ID, Description, matches("[A-Z]_vs_B")) %>%
+  # filter for proteins of interest
+  filter(grepl("ester|lipase|cutinase|protease|nepenth", Description)) %>%
+  # TODO add time columns, sort by time in heatmap
+  # convert to long format
+  pivot_longer(-c(Description, Protein.ID),
+               names_to = "contrast",
+               values_to = "logFC") %>%
+  # plot heatmap
+  ggplot(aes(x = contrast, y = Description, fill = logFC)) +
+  geom_tile() +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0) +
+  theme_minimal() +
+  # format axis labels
+  theme(axis.title.x=element_blank(),
+        axis.title.y=element_blank(),
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=.5, size = 6),
+        axis.text.y = element_text(size = 6),
+        legend.text = element_text(size = 8))
+
+
+```
+
+
+```{r condition:time interaction}
+# Construct design matrix condition:time interaction
+# does not make much sense to use interaction
+# design2 <- model.matrix(~0 + CONDITION + TIME + CONDITION:TIME, data = eset)
+# # create names for the condition:time interaction columns
+# cond_time_interaction <- c()
+# for (t in levels(eset$TIME)[-1]) {
+#   for (con in levels(eset$CONDITION)[-1]) {
+#     cond_time_interaction = c(cond_time_interaction, paste(con, t, sep = ":"))
+#   }
+# }
+# # set names for the design matrix columns
+# colnames(design2) <- c(levels(eset$CONDITION),
+#                               levels(eset$TIME)[-1],
+#                               cond_time_interaction)
+```
 
 
 ## Analysis in DEP
@@ -202,7 +375,9 @@ data$`Gene` %>% duplicated() %>% any()
 # make table of duplicated gene names
 data %>% group_by(Gene) %>% summarize(frequency = n()) %>% 
   arrange(desc(frequency)) %>% filter(frequency > 1)
+
 ```
+
 
 ```{r remove contaminants}
 # remove contaminants based on contaminant tag "cRAP..." in protein name
@@ -238,8 +413,8 @@ sample_annotation <- sample_annotation %>%
   set_colnames(c("label", "condition")) %>%
   # using stringr package extract information from sample names
   mutate(condition = str_replace(label, "_[1-3]$", ""), # ERROR when using one letter code for condition
-         replicate = str_split_i(label, "_", -1))
-         #time = str_split_i(label, "_", -2))
+         replicate = str_split_i(label, "_", -1),
+         time = str_split_i(label, "_", -2))
 # TODO maybe use SummarizedExperimentfromExpressionSet
 
 # Combine data to SummarisedEXperiment
@@ -304,7 +479,7 @@ plot_imputation(data_norm, data_imp_man)
 # Differential enrichment analysis  based on linear models and empirical Bayes statistics
 
 # Test every sample versus control
-data_diff <- test_diff(data_imp, type = "control", control = "N_B_t0")
+data_diff <- test_diff(data_imp, type = "control", control = "N_B_t0", design_formula = formula(~ 0 + condition + time))
 ```
 
 
